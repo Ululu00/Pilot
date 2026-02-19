@@ -11,7 +11,206 @@ import numpy as np
 #from collections import OrderedDict
 from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
+class MultiScalePatchTST_backbone(nn.Module):
+    def __init__(self, c_in:int, context_window:int, target_window:int, patch_lens:list, strides:list, max_seq_len:Optional[int]=1024, 
+                 n_layers:int=3, d_model=128, n_heads=16, d_k:Optional[int]=None, d_v:Optional[int]=None,
+                 d_ff:int=256, norm:str='BatchNorm', attn_dropout:float=0., dropout:float=0., act:str="gelu", key_padding_mask:bool='auto',
+                 padding_var:Optional[int]=None, attn_mask:Optional[Tensor]=None, res_attention:bool=True, pre_norm:bool=False, store_attn:bool=False,
+                 pe:str='zeros', learn_pe:bool=True, fc_dropout:float=0., head_dropout = 0, padding_patch = None,
+                 pretrain_head:bool=False, head_type = 'flatten', individual = False, revin = True, affine = True, subtract_last = False,
+                 verbose:bool=False, **kwargs):
+        
+        super().__init__()
+        
+        # 1. RevIn
+        self.revin = revin
+        if self.revin: self.revin_layer = RevIN(c_in, affine=affine, subtract_last=subtract_last)
+        
+        # 2. Multi-Scale Config
+        self.patch_lens = patch_lens  # 예: [16, 32, 48]
+        if strides is None:
+            self.strides = [pl // 2 for pl in patch_lens]
+        elif isinstance(strides, int):
+            self.strides = [strides for _ in patch_lens]
+        else:
+            self.strides = list(strides)
+        if len(self.strides) != len(self.patch_lens):
+            raise ValueError("len(strides) must match len(patch_lens)")
 
+        self.base_stride = self.strides[0]
+        if self.base_stride <= 0:
+            raise ValueError("stride must be a positive integer")
+        if any(s <= 0 for s in self.strides):
+            raise ValueError("all strides must be positive integers")
+        self.padding_patch = padding_patch
+        
+        # 기준이 되는 가장 작은 patch length (Center Alignment의 기준점)
+        base_patch_len = patch_lens[0] 
+        self.base_patch_len = base_patch_len
+
+        # Stage-2: scale마다 patch 개수를 별도로 계산해 패딩 토큰 폭증을 방지
+        self.patch_nums = [
+            self._compute_patch_num(context_window, p_len, stride)
+            for p_len, stride in zip(self.patch_lens, self.strides)
+        ]
+        self.base_patch_num = self.patch_nums[0]
+        self.max_patch_num = max(self.patch_nums)
+        self.total_patch_num = sum(self.patch_nums)
+            
+        # 3. Projections & Embeddings
+        # 각 스케일별로 다른 Projection Layer를 가짐 (길이가 달라도 d_model로 통일)
+        self.W_P = nn.ModuleList([
+            nn.Linear(pl, d_model) for pl in patch_lens
+        ])
+        
+        # Scale Embedding: 각 스케일 ID에 대한 임베딩 (0: scale1, 1: scale2 ...)
+        self.scale_embedding = nn.Embedding(len(patch_lens), d_model)
+        # Continuous patch-length embedding (e.g. log2 ratio to base patch length)
+        self.patch_len_proj = nn.Linear(1, d_model)
+        self.len_alpha = nn.Parameter(torch.zeros(1))
+        patch_len_feats = [[np.log2(pl / self.base_patch_len)] for pl in self.patch_lens]
+        self.register_buffer(
+            "patch_len_features", torch.tensor(patch_len_feats, dtype=torch.float32), persistent=False
+        )
+        # Ablation switches (toggle by uncommenting one line)
+        self.use_scale_embedding = True
+        # self.use_scale_embedding = False  # disable scale-id embedding
+        self.use_len_gate = True
+        # self.use_len_gate = False         # use len_emb without len_alpha gate
+        self.use_cross_gate = True
+        # self.use_cross_gate = False       # use cross_pos_emb without cross_alpha gate
+
+        # Cross-scale relative position embedding:
+        # maps each scale token to its base-scale center index.
+        self.cross_pos_embedding = nn.Embedding(self.base_patch_num, d_model)
+        self.cross_alpha = nn.Parameter(torch.zeros(1))
+
+        # 4. Backbone (Shared Transformer Encoder)
+        # Encoder는 가변 토큰 길이를 처리하므로, PE 테이블은 최대 patch_num 기준으로 생성한다.
+        self.backbone = TSTiEncoder(c_in, patch_num=self.max_patch_num, patch_len=base_patch_len, max_seq_len=max_seq_len,
+                                n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff,
+                                attn_dropout=attn_dropout, dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var,
+                                attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
+                                pe=pe, learn_pe=learn_pe, verbose=verbose, **kwargs)
+
+        # 5. Head
+        # Flatten Head의 입력 차원은 (sum(scale별 patch_num) * d_model)
+        self.head_nf = d_model * self.total_patch_num
+        self.n_vars = c_in
+        self.pretrain_head = pretrain_head
+        self.head_type = head_type
+        self.individual = individual
+
+        if self.pretrain_head: 
+            self.head = self.create_pretrain_head(self.head_nf, c_in, fc_dropout)
+        elif head_type == 'flatten': 
+            self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
+        
+    def _compute_patch_num(self, seq_len:int, patch_len:int, stride:int) -> int:
+        # Center alignment를 위해 좌측 패딩을 고려한 scale별 토큰 개수 계산
+        pad_left = (patch_len - self.base_patch_len) // 2
+        pad_right = stride if self.padding_patch == 'end' else 0
+        padded_len = seq_len + pad_left + pad_right
+        if padded_len < patch_len:
+            return 1
+        return int((padded_len - patch_len) / stride + 1)
+    
+    
+    def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
+        # norm
+        if self.revin: 
+            z = z.permute(0,2,1)
+            z = self.revin_layer(z, 'norm')
+            z = z.permute(0,2,1)
+            
+        # Multi-Scale Patching & Projection
+        bs, n_vars, seq_len = z.shape
+        scale_tokens = []
+        
+        for i, (p_len, stride, patch_num, proj) in enumerate(zip(self.patch_lens, self.strides, self.patch_nums, self.W_P)):
+            # -----------------------------------------------------------
+            # Center Alignment Logic
+            # -----------------------------------------------------------
+            # 목표: Scale이 커져도 i번째 패치의 중심(Center)이 Scale 0의 i번째 패치 중심과 같아야 함.
+            # 공식: Pad_Left = (Current_Len - Base_Len) // 2
+            # 이렇게 하면 더 긴 패치가 왼쪽으로 확장되어 중심을 유지함.
+            pad_left = (p_len - self.base_patch_len) // 2
+            
+            # unfold가 정상 작동하기 위한 총 필요 길이 계산 (scale별 patch_num 사용)
+            req_len = (patch_num - 1) * stride + p_len
+            pad_total = req_len - seq_len
+            pad_right = pad_total - pad_left
+            pad_right = max(0, pad_right)
+            
+            # 패딩 수행 (좌/우 비대칭 패딩일 수 있음)
+            # F.pad는 (Left, Right) 순서
+            z_padded = F.pad(z, (pad_left, pad_right)) # [bs, nvars, padded_len]
+            
+            # Patching
+            patches = z_padded.unfold(dimension=-1, size=p_len, step=stride) # [bs, nvars, patch_num_i, p_len]
+            patches = patches[:, :, :patch_num, :]
+            patches = patches.permute(0,1,3,2)  # [bs, nvars, p_len, patch_num_i]
+            
+            # Projection
+            patches = patches.permute(0,1,3,2)   # [bs, nvars, patch_num_i, p_len]
+            emb = proj(patches)                  # [bs, nvars, patch_num_i, d_model]
+            
+            # Add Encodings
+            # 1. Positional Encoding (Time): backbone.W_pos 사용 (모든 스케일이 시간 위치는 공유)
+            # 2. Scale Encoding (Resolution): i번째 스케일 임베딩 더하기
+            
+            # backbone.W_pos shape: [max_patch_num, d_model]
+            pos_emb = self.backbone.W_pos[:patch_num]
+            if self.use_scale_embedding:
+                scale_emb = self.scale_embedding.weight[i] # [d_model]
+            else:
+                scale_emb = 0.0
+            len_feat = self.patch_len_features[i:i+1].to(dtype=emb.dtype)  # [1, 1]
+            len_emb = self.patch_len_proj(len_feat).squeeze(0)              # [d_model]
+            center_idx = torch.arange(patch_num, device=z.device, dtype=torch.float32)
+            center_idx = torch.round(center_idx * (stride / self.base_stride)).long()
+            valid = center_idx < self.base_patch_num
+            center_idx = center_idx.clamp(min=0, max=self.base_patch_num - 1)
+            cross_pos_emb = self.cross_pos_embedding(center_idx)  # [patch_num_i, d_model]
+            valid = valid.unsqueeze(-1).to(cross_pos_emb.dtype)
+            cross_pos_emb = cross_pos_emb * valid
+            if self.use_len_gate:
+                len_term = self.len_alpha * len_emb
+            else:
+                len_term = len_emb
+            if self.use_cross_gate:
+                cross_term = self.cross_alpha * cross_pos_emb
+            else:
+                cross_term = cross_pos_emb
+            
+            # Token Sum
+            out = emb + pos_emb + scale_emb + len_term + cross_term
+            scale_tokens.append(out)
+
+        # Concat all scales
+        # 모든 스케일의 토큰을 sequence 차원(dim=2)으로 연결 -> Transformer가 한 번에 처리
+        # z shape: [bs, nvars, sum(scale별 patch_num), d_model]
+        z = torch.cat(scale_tokens, dim=2) 
+        
+        # Transpose for Transformer [bs * nvars, seq_len, d_model] logic in backbone
+        z = z.permute(0,1,3,2) # [bs, nvars, d_model, total_tokens]
+        
+        # Model (Transformer Encoder)
+        # TSTiEncoder는 입력을 [bs, nvars, d_model, patch_num] 형태로 받아서 처리함
+        # 내부적으로 reshape해서 [bs*nvars, patch_num, d_model]로 만듦
+        # 여기서는 patch_num 대신 total_tokens가 들어감
+        z = self.backbone.encoder_forward_custom(z) # *아래 TSTiEncoder 수정 필요*
+                                                                 
+        # Head
+        z = self.head(z) # z: [bs x nvars x target_window] 
+        
+        # denorm
+        if self.revin: 
+            z = z.permute(0,2,1)
+            z = self.revin_layer(z, 'denorm')
+            z = z.permute(0,2,1)
+        return z
+    
 # Cell
 class PatchTST_backbone(nn.Module):
     def __init__(self, c_in:int, context_window:int, target_window:int, patch_len:int, stride:int, max_seq_len:Optional[int]=1024, 
@@ -153,7 +352,7 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         self.encoder = TSTEncoder(q_len, d_model, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
                                    pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
 
-        
+       
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
         n_vars = x.shape[1]
@@ -170,6 +369,24 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
         
         return z    
+
+    def encoder_forward_custom(self, x):
+        # x: [bs, nvars, d_model, total_tokens]
+        n_vars = x.shape[1]
+        total_tokens = x.shape[3]
+        
+        x = x.permute(0,1,3,2) # [bs, nvars, total_tokens, d_model]
+        u = torch.reshape(x, (x.shape[0]*x.shape[1], total_tokens, x.shape[3])) # [bs*nvars, total_tokens, d_model]
+        
+        # Dropout (Encoder 들어가기 전)
+        u = self.dropout(u)
+        
+        # Encoder
+        z = self.encoder(u) # [bs*nvars, total_tokens, d_model]
+        
+        z = torch.reshape(z, (-1, n_vars, z.shape[-2], z.shape[-1])) # [bs, nvars, total_tokens, d_model]
+        z = z.permute(0,1,3,2) # [bs, nvars, d_model, total_tokens]
+        return z
             
             
     
@@ -376,4 +593,3 @@ class _ScaledDotProductAttention(nn.Module):
 
         if self.res_attention: return output, attn_weights, attn_scores
         else: return output, attn_weights
-

@@ -463,3 +463,12 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/emacs,jetbrains+all,jupyternotebooks,linux,macos,microsoftoffice,notepadpp,python,tortoisegit,vim,visualstudiocode,windows
+
+# Project outputs (do not push large/generated experiment artifacts)
+PatchTST_supervised/dataset/
+PatchTST_supervised/checkpoints/
+PatchTST_supervised/results/
+PatchTST_supervised/test_results/
+PatchTST_supervised/logs_multi*/
+PatchTST_supervised/experiment_results_*.csv
+PatchTST_supervised/result.txt
