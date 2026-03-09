@@ -5,26 +5,6 @@ from exp.exp_main import Exp_Main
 import random
 import numpy as np
 
-def print_alpha_summary(model):
-    core_model = model.module if hasattr(model, 'module') else model
-    alpha_pairs = []
-    for name in ('model', 'model_res', 'model_trend'):
-        backbone = getattr(core_model, name, None)
-        if backbone is None:
-            continue
-        if hasattr(backbone, 'len_alpha') and hasattr(backbone, 'cross_alpha'):
-            len_alpha = float(backbone.len_alpha.detach().cpu().item())
-            cross_alpha = float(backbone.cross_alpha.detach().cpu().item())
-            alpha_pairs.append((name, len_alpha, cross_alpha))
-
-    if not alpha_pairs:
-        return
-
-    mean_len_alpha = sum(v[1] for v in alpha_pairs) / len(alpha_pairs)
-    mean_cross_alpha = sum(v[2] for v in alpha_pairs) / len(alpha_pairs)
-    # This line is parsed by run.experiments.py
-    print(f"ALPHAS len_alpha={mean_len_alpha:.8f} cross_alpha={mean_cross_alpha:.8f}")
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Autoformer & Transformer family for Time Series Forecasting')
 
@@ -69,7 +49,15 @@ if __name__ == '__main__':
     parser.add_argument('--decomposition', type=int, default=0, help='decomposition; True 1 False 0')
     parser.add_argument('--kernel_size', type=int, default=25, help='decomposition-kernel')
     parser.add_argument('--individual', type=int, default=0, help='individual head; True 1 False 0')
-    parser.add_argument('--scales', type=int, nargs='+', default=[1], help='List of scales for Multi-scale PatchTST (e.g. 1 2 4)')
+    parser.add_argument('--scales', type=int, nargs='+', default=[1, 3, 5], help='List of scales for Multi-scale PatchTST (default: 1 3 5)')
+    parser.add_argument('--stride_strategy', type=str, default='half', choices=['half', 'linear', 'equal'],
+                        help="Multi-scale stride strategy: 'half' (0.5*patch_len, default), 'linear' (ratio 0.5->1.0 by scale index), 'equal' (1.0*patch_len).")
+    parser.add_argument('--pe', type=str, default='rope_abs',
+                        help="PatchTST positional encoding type. 'rope' (RoPE only), 'rope_abs' (additive+RoPE), or additive-only types like 'zeros', 'sincos'.")
+    parser.add_argument('--learn_pe', type=int, default=0,
+                        help='1: learn additive PE table, 0: fixed. Used for additive-only or rope_abs modes.')
+    parser.add_argument('--patch_embed_act', type=str, default='relu', choices=['relu', 'gelu'],
+                        help="Deprecated compatibility flag. Patch-wise embedding is fixed to 1-layer nn.Linear.")
 
     # Formers 
     parser.add_argument('--embed_type', type=int, default=0, help='0: default 1: value embedding + temporal embedding + positional embedding 2: value embedding + temporal embedding 3: value embedding + positional embedding 4: value embedding')
@@ -119,7 +107,17 @@ if __name__ == '__main__':
     else:
         args.patch_lens = [args.patch_len]
 
-    args.strides = [max(1, pl // 2) for pl in args.patch_lens]
+    n_scales = len(args.patch_lens)
+    if args.stride_strategy == 'half':
+        ratios = [0.5 for _ in args.patch_lens]
+    elif args.stride_strategy == 'linear':
+        if n_scales == 1:
+            ratios = [0.5]
+        else:
+            ratios = [0.5 + 0.5 * (i / (n_scales - 1)) for i in range(n_scales)]
+    else:
+        ratios = [1.0 for _ in args.patch_lens]
+    args.strides = [max(1, int(round(pl * r))) for pl, r in zip(args.patch_lens, ratios)]
 
     # Keep legacy single-stride field aligned with the base scale.
     args.stride = args.strides[0]
@@ -174,7 +172,6 @@ if __name__ == '__main__':
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             exp.test(setting)
-            print_alpha_summary(exp.model)
 
             if args.do_predict:
                 print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
@@ -203,6 +200,5 @@ if __name__ == '__main__':
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)
-        print_alpha_summary(exp.model)
         torch.cuda.empty_cache()
         

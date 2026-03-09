@@ -11,16 +11,62 @@ import numpy as np
 #from collections import OrderedDict
 from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
+
+
+def build_patch_projection(in_dim: int, out_dim: int, act: str = 'relu') -> nn.Module:
+    # Keep `act` arg for backward compatibility, but projection is fixed to 1-layer.
+    _ = act
+    return nn.Linear(in_dim, out_dim)
+
+
+class RotaryEmbedding(nn.Module):
+    """Applies RoPE on the head dimension of q/k tensors."""
+    def __init__(self, dim: int, base: int = 10000):
+        super().__init__()
+        self.dim = dim
+        self.rotary_dim = dim if dim % 2 == 0 else dim - 1
+        if self.rotary_dim <= 0:
+            raise ValueError(f'RoPE requires dim >= 2, got dim={dim}')
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+    def _apply_rotary(self, x: Tensor) -> Tensor:
+        # x: [bs, n_heads, seq_len, head_dim]
+        seq_len = x.size(-2)
+        freqs = torch.einsum('i,j->ij', torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype), self.inv_freq)
+        cos = freqs.cos().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # [1,1,seq,rotary_dim/2]
+        sin = freqs.sin().to(dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # [1,1,seq,rotary_dim/2]
+
+        x_rot = x[..., :self.rotary_dim]
+        x_pass = x[..., self.rotary_dim:]
+        x_even = x_rot[..., 0::2]
+        x_odd = x_rot[..., 1::2]
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        x_rotated = torch.stack((x_rot_even, x_rot_odd), dim=-1).flatten(-2)
+        return torch.cat((x_rotated, x_pass), dim=-1) if x_pass.numel() > 0 else x_rotated
+
+    def apply_qk(self, q: Tensor, k: Tensor):
+        return self._apply_rotary(q), self._apply_rotary(k)
+
+
 class MultiScalePatchTST_backbone(nn.Module):
     def __init__(self, c_in:int, context_window:int, target_window:int, patch_lens:list, strides:list, max_seq_len:Optional[int]=1024, 
                  n_layers:int=3, d_model=128, n_heads=16, d_k:Optional[int]=None, d_v:Optional[int]=None,
                  d_ff:int=256, norm:str='BatchNorm', attn_dropout:float=0., dropout:float=0., act:str="gelu", key_padding_mask:bool='auto',
                  padding_var:Optional[int]=None, attn_mask:Optional[Tensor]=None, res_attention:bool=True, pre_norm:bool=False, store_attn:bool=False,
-                 pe:str='zeros', learn_pe:bool=True, fc_dropout:float=0., head_dropout = 0, padding_patch = None,
+                 pe:str='rope_abs', learn_pe:bool=True, fc_dropout:float=0., head_dropout = 0, padding_patch = None,
                  pretrain_head:bool=False, head_type = 'flatten', individual = False, revin = True, affine = True, subtract_last = False,
                  verbose:bool=False, **kwargs):
         
         super().__init__()
+
+        # Deprecated: length embedding branch is disabled, keep arg for compatibility.
+        _ = kwargs.pop('len_alpha_fixed', None)
+        cross_alpha_fixed = kwargs.pop('cross_alpha_fixed', None)
+        learn_alpha = bool(kwargs.pop('learn_alpha', True))
+        # Deprecated compatibility flag; projection is now fixed to 1-layer.
+        _ = kwargs.pop('patch_embed_act', None)
         
         # 1. RevIn
         self.revin = revin
@@ -29,7 +75,7 @@ class MultiScalePatchTST_backbone(nn.Module):
         # 2. Multi-Scale Config
         self.patch_lens = patch_lens  # 예: [16, 32, 48]
         if strides is None:
-            self.strides = [pl // 2 for pl in patch_lens]
+            self.strides = [max(1, pl) for pl in patch_lens]
         elif isinstance(strides, int):
             self.strides = [strides for _ in patch_lens]
         else:
@@ -59,31 +105,24 @@ class MultiScalePatchTST_backbone(nn.Module):
             
         # 3. Projections & Embeddings
         # 각 스케일별로 다른 Projection Layer를 가짐 (길이가 달라도 d_model로 통일)
-        self.W_P = nn.ModuleList([
-            nn.Linear(pl, d_model) for pl in patch_lens
-        ])
+        self.W_P = nn.ModuleList([build_patch_projection(pl, d_model) for pl in patch_lens])
         
         # Scale Embedding: 각 스케일 ID에 대한 임베딩 (0: scale1, 1: scale2 ...)
         self.scale_embedding = nn.Embedding(len(patch_lens), d_model)
-        # Continuous patch-length embedding (e.g. log2 ratio to base patch length)
-        self.patch_len_proj = nn.Linear(1, d_model)
-        self.len_alpha = nn.Parameter(torch.zeros(1))
-        patch_len_feats = [[np.log2(pl / self.base_patch_len)] for pl in self.patch_lens]
-        self.register_buffer(
-            "patch_len_features", torch.tensor(patch_len_feats, dtype=torch.float32), persistent=False
-        )
+        # Length embedding branch is off. Keep len_alpha as a frozen dummy for log/CSV compatibility.
+        self.len_alpha = nn.Parameter(torch.zeros(1), requires_grad=False)
+
         # Ablation switches (toggle by uncommenting one line)
         self.use_scale_embedding = True
         # self.use_scale_embedding = False  # disable scale-id embedding
-        self.use_len_gate = True
-        # self.use_len_gate = False         # use len_emb without len_alpha gate
         self.use_cross_gate = True
         # self.use_cross_gate = False       # use cross_pos_emb without cross_alpha gate
 
         # Cross-scale relative position embedding:
         # maps each scale token to its base-scale center index.
         self.cross_pos_embedding = nn.Embedding(self.base_patch_num, d_model)
-        self.cross_alpha = nn.Parameter(torch.zeros(1))
+        init_cross_alpha = float(cross_alpha_fixed) if cross_alpha_fixed is not None else 0.0
+        self.cross_alpha = nn.Parameter(torch.tensor([init_cross_alpha], dtype=torch.float32), requires_grad=learn_alpha)
 
         # 4. Backbone (Shared Transformer Encoder)
         # Encoder는 가변 토큰 길이를 처리하므로, PE 테이블은 최대 patch_num 기준으로 생성한다.
@@ -160,13 +199,14 @@ class MultiScalePatchTST_backbone(nn.Module):
             # 2. Scale Encoding (Resolution): i번째 스케일 임베딩 더하기
             
             # backbone.W_pos shape: [max_patch_num, d_model]
-            pos_emb = self.backbone.W_pos[:patch_num]
+            if self.backbone.W_pos is not None:
+                pos_emb = self.backbone.W_pos[:patch_num]
+            else:
+                pos_emb = 0.0
             if self.use_scale_embedding:
                 scale_emb = self.scale_embedding.weight[i] # [d_model]
             else:
                 scale_emb = 0.0
-            len_feat = self.patch_len_features[i:i+1].to(dtype=emb.dtype)  # [1, 1]
-            len_emb = self.patch_len_proj(len_feat).squeeze(0)              # [d_model]
             center_idx = torch.arange(patch_num, device=z.device, dtype=torch.float32)
             center_idx = torch.round(center_idx * (stride / self.base_stride)).long()
             valid = center_idx < self.base_patch_num
@@ -174,17 +214,13 @@ class MultiScalePatchTST_backbone(nn.Module):
             cross_pos_emb = self.cross_pos_embedding(center_idx)  # [patch_num_i, d_model]
             valid = valid.unsqueeze(-1).to(cross_pos_emb.dtype)
             cross_pos_emb = cross_pos_emb * valid
-            if self.use_len_gate:
-                len_term = self.len_alpha * len_emb
-            else:
-                len_term = len_emb
             if self.use_cross_gate:
                 cross_term = self.cross_alpha * cross_pos_emb
             else:
                 cross_term = cross_pos_emb
             
             # Token Sum
-            out = emb + pos_emb + scale_emb + len_term + cross_term
+            out = emb + pos_emb + scale_emb + cross_term
             scale_tokens.append(out)
 
         # Concat all scales
@@ -217,7 +253,7 @@ class PatchTST_backbone(nn.Module):
                  n_layers:int=3, d_model=128, n_heads=16, d_k:Optional[int]=None, d_v:Optional[int]=None,
                  d_ff:int=256, norm:str='BatchNorm', attn_dropout:float=0., dropout:float=0., act:str="gelu", key_padding_mask:bool='auto',
                  padding_var:Optional[int]=None, attn_mask:Optional[Tensor]=None, res_attention:bool=True, pre_norm:bool=False, store_attn:bool=False,
-                 pe:str='zeros', learn_pe:bool=True, fc_dropout:float=0., head_dropout = 0, padding_patch = None,
+                 pe:str='rope_abs', learn_pe:bool=True, fc_dropout:float=0., head_dropout = 0, padding_patch = None,
                  pretrain_head:bool=False, head_type = 'flatten', individual = False, revin = True, affine = True, subtract_last = False,
                  verbose:bool=False, **kwargs):
         
@@ -329,28 +365,44 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
                  n_layers=3, d_model=128, n_heads=16, d_k=None, d_v=None,
                  d_ff=256, norm='BatchNorm', attn_dropout=0., dropout=0., act="gelu", store_attn=False,
                  key_padding_mask='auto', padding_var=None, attn_mask=None, res_attention=True, pre_norm=False,
-                 pe='zeros', learn_pe=True, verbose=False, **kwargs):
+                 pe='rope_abs', learn_pe=True, verbose=False, **kwargs):
         
         
         super().__init__()
         
         self.patch_num = patch_num
         self.patch_len = patch_len
+        # Deprecated compatibility flag; projection is now fixed to 1-layer.
+        _ = kwargs.pop('patch_embed_act', None)
         
         # Input encoding
         q_len = patch_num
-        self.W_P = nn.Linear(patch_len, d_model)        # Eq 1: projection of feature vectors onto a d-dim vector space
+        self.W_P = build_patch_projection(patch_len, d_model)
         self.seq_len = q_len
 
-        # Positional encoding
-        self.W_pos = positional_encoding(pe, learn_pe, q_len, d_model)
+        # Positional encoding mode:
+        # - additive only: pe='zeros'/'sincos'/...
+        # - RoPE only: pe='rope'
+        # - additive + RoPE: pe='rope_abs' (or 'rope+abs')
+        use_rope, additive_pe = self._resolve_pe_mode(pe)
+        self.use_rope = use_rope
+        if additive_pe is None:
+            self.W_pos = None
+        else:
+            self.W_pos = positional_encoding(additive_pe, learn_pe, q_len, d_model)
+        if self.use_rope:
+            head_dim = d_model // n_heads if d_k is None else d_k
+            self.rotary_emb = RotaryEmbedding(head_dim)
+        else:
+            self.rotary_emb = None
 
         # Residual dropout
         self.dropout = nn.Dropout(dropout)
 
         # Encoder
         self.encoder = TSTEncoder(q_len, d_model, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
-                                   pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
+                                   pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers,
+                                   store_attn=store_attn, rotary_emb=self.rotary_emb)
 
        
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
@@ -361,7 +413,9 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         x = self.W_P(x)                                                          # x: [bs x nvars x patch_num x d_model]
 
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
-        u = self.dropout(u + self.W_pos)                                         # u: [bs * nvars x patch_num x d_model]
+        if self.W_pos is not None:
+            u = u + self.W_pos
+        u = self.dropout(u)                                                      # u: [bs * nvars x patch_num x d_model]
 
         # Encoder
         z = self.encoder(u)                                                      # z: [bs * nvars x patch_num x d_model]
@@ -387,6 +441,27 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         z = torch.reshape(z, (-1, n_vars, z.shape[-2], z.shape[-1])) # [bs, nvars, total_tokens, d_model]
         z = z.permute(0,1,3,2) # [bs, nvars, d_model, total_tokens]
         return z
+
+    @staticmethod
+    def _resolve_pe_mode(pe):
+        if not isinstance(pe, str):
+            return False, pe
+
+        pe_key = pe.lower().strip()
+        rope_only_aliases = {'rope', 'rotary', 'rotary_pe', 'rope_only'}
+        rope_abs_aliases = {'rope_abs', 'rope+abs', 'abs+rope', 'abs_rope'}
+
+        if pe_key in rope_only_aliases:
+            return True, None
+        if pe_key in rope_abs_aliases:
+            return True, 'zeros'
+        if pe_key.startswith('rope+'):
+            additive = pe_key.split('+', 1)[1].strip()
+            return True, additive if additive else 'zeros'
+        if pe_key.endswith('+rope'):
+            additive = pe_key.rsplit('+', 1)[0].strip()
+            return True, additive if additive else 'zeros'
+        return False, pe
             
             
     
@@ -394,13 +469,13 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
 class TSTEncoder(nn.Module):
     def __init__(self, q_len, d_model, n_heads, d_k=None, d_v=None, d_ff=None, 
                         norm='BatchNorm', attn_dropout=0., dropout=0., activation='gelu',
-                        res_attention=False, n_layers=1, pre_norm=False, store_attn=False):
+                        res_attention=False, n_layers=1, pre_norm=False, store_attn=False, rotary_emb: Optional[nn.Module]=None):
         super().__init__()
 
         self.layers = nn.ModuleList([TSTEncoderLayer(q_len, d_model, n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm,
                                                       attn_dropout=attn_dropout, dropout=dropout,
                                                       activation=activation, res_attention=res_attention,
-                                                      pre_norm=pre_norm, store_attn=store_attn) for i in range(n_layers)])
+                                                      pre_norm=pre_norm, store_attn=store_attn, rotary_emb=rotary_emb) for i in range(n_layers)])
         self.res_attention = res_attention
 
     def forward(self, src:Tensor, key_padding_mask:Optional[Tensor]=None, attn_mask:Optional[Tensor]=None):
@@ -417,7 +492,8 @@ class TSTEncoder(nn.Module):
 
 class TSTEncoderLayer(nn.Module):
     def __init__(self, q_len, d_model, n_heads, d_k=None, d_v=None, d_ff=256, store_attn=False,
-                 norm='BatchNorm', attn_dropout=0, dropout=0., bias=True, activation="gelu", res_attention=False, pre_norm=False):
+                 norm='BatchNorm', attn_dropout=0, dropout=0., bias=True, activation="gelu", res_attention=False,
+                 pre_norm=False, rotary_emb: Optional[nn.Module]=None):
         super().__init__()
         assert not d_model%n_heads, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         d_k = d_model // n_heads if d_k is None else d_k
@@ -425,7 +501,8 @@ class TSTEncoderLayer(nn.Module):
 
         # Multi-Head attention
         self.res_attention = res_attention
-        self.self_attn = _MultiheadAttention(d_model, n_heads, d_k, d_v, attn_dropout=attn_dropout, proj_dropout=dropout, res_attention=res_attention)
+        self.self_attn = _MultiheadAttention(d_model, n_heads, d_k, d_v, attn_dropout=attn_dropout, proj_dropout=dropout,
+                                             res_attention=res_attention, rotary_emb=rotary_emb)
 
         # Add & Norm
         self.dropout_attn = nn.Dropout(dropout)
@@ -487,7 +564,8 @@ class TSTEncoderLayer(nn.Module):
 
 
 class _MultiheadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, d_k=None, d_v=None, res_attention=False, attn_dropout=0., proj_dropout=0., qkv_bias=True, lsa=False):
+    def __init__(self, d_model, n_heads, d_k=None, d_v=None, res_attention=False, attn_dropout=0., proj_dropout=0.,
+                 qkv_bias=True, lsa=False, rotary_emb: Optional[nn.Module]=None):
         """Multi Head Attention Layer
         Input shape:
             Q:       [batch_size (bs) x max_q_len x d_model]
@@ -503,6 +581,7 @@ class _MultiheadAttention(nn.Module):
         self.W_Q = nn.Linear(d_model, d_k * n_heads, bias=qkv_bias)
         self.W_K = nn.Linear(d_model, d_k * n_heads, bias=qkv_bias)
         self.W_V = nn.Linear(d_model, d_v * n_heads, bias=qkv_bias)
+        self.rotary_emb = rotary_emb
 
         # Scaled Dot-Product Attention (multiple heads)
         self.res_attention = res_attention
@@ -521,8 +600,11 @@ class _MultiheadAttention(nn.Module):
 
         # Linear (+ split in multiple heads)
         q_s = self.W_Q(Q).view(bs, -1, self.n_heads, self.d_k).transpose(1,2)       # q_s    : [bs x n_heads x max_q_len x d_k]
-        k_s = self.W_K(K).view(bs, -1, self.n_heads, self.d_k).permute(0,2,3,1)     # k_s    : [bs x n_heads x d_k x q_len] - transpose(1,2) + transpose(2,3)
+        k_s = self.W_K(K).view(bs, -1, self.n_heads, self.d_k).transpose(1,2)       # k_s    : [bs x n_heads x q_len x d_k]
         v_s = self.W_V(V).view(bs, -1, self.n_heads, self.d_v).transpose(1,2)       # v_s    : [bs x n_heads x q_len x d_v]
+        if self.rotary_emb is not None:
+            q_s, k_s = self.rotary_emb.apply_qk(q_s, k_s)
+        k_s = k_s.transpose(-2, -1)                                                   # k_s    : [bs x n_heads x d_k x q_len]
 
         # Apply Scaled Dot-Product Attention (multiple heads)
         if self.res_attention:

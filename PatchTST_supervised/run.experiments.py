@@ -1,106 +1,94 @@
-import os
-import subprocess
-import re
+import argparse
 import csv
 import itertools
+import os
+import re
+import subprocess
 import sys
-import torch 
-import math
-from collections import defaultdict
 from datetime import datetime
 
 # ==================================================================================
-# [1] 데이터셋별 공식 하이퍼파라미터
+# [1] Dataset Hyperparameters
 # ==================================================================================
 HYPER_PARAMS = {
     'etth1': {
-        'enc_in': 7, 'e_layers': 3, 'n_heads': 4, 'd_model': 16, 'd_ff': 128,
-        'dropout': 0.3, 'fc_dropout': 0.3, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 128, 'learning_rate': 0.0001,
-        'patience': 100
+        'enc_in': 7, 'e_layers': 1, 'n_heads': 8, 'd_model': 256, 'd_ff': 2048,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 4, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     },
     'etth2': {
-        'enc_in': 7, 'e_layers': 3, 'n_heads': 4, 'd_model': 16, 'd_ff': 128,
-        'dropout': 0.3, 'fc_dropout': 0.3, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 128, 'learning_rate': 0.0001,
-        'patience': 100
+        'enc_in': 7, 'e_layers': 1, 'n_heads': 8, 'd_model': 256, 'd_ff': 1024,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 16, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     },
     'ettm1': {
-        'enc_in': 7, 'e_layers': 3, 'n_heads': 16, 'd_model': 128, 'd_ff': 256,
-        'dropout': 0.2, 'fc_dropout': 0.2, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 128, 'learning_rate': 0.0001,
-        'patience': 20, 'lradj': 'TST', 'pct_start': 0.4
+        'enc_in': 7, 'e_layers': 1, 'n_heads': 8, 'd_model': 256, 'd_ff': 2048,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 4, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     },
     'ettm2': {
-        'enc_in': 7, 'e_layers': 3, 'n_heads': 16, 'd_model': 128, 'd_ff': 256,
-        'dropout': 0.2, 'fc_dropout': 0.2, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 128, 'learning_rate': 0.0001,
-        'patience': 20, 'lradj': 'TST', 'pct_start': 0.4
+        'enc_in': 7, 'e_layers': 1, 'n_heads': 8, 'd_model': 256, 'd_ff': 2048,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 32, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     },
     'electricity': {
-        'enc_in': 321, 'e_layers': 3, 'n_heads': 16, 'd_model': 128, 'd_ff': 256,
-        'dropout': 0.2, 'fc_dropout': 0.2, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 32, 'learning_rate': 0.0001,
-        'patience': 10, 'lradj': 'TST', 'pct_start': 0.2
+        'enc_in': 321, 'e_layers': 4, 'n_heads': 8, 'd_model': 512, 'd_ff': 512,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 4, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     },
     'traffic': {
-        'enc_in': 862, 'e_layers': 3, 'n_heads': 16, 'd_model': 128, 'd_ff': 256,
-        'dropout': 0.2, 'fc_dropout': 0.2, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 24, 'learning_rate': 0.0001,
-        'patience': 10, 'lradj': 'TST', 'pct_start': 0.2
+        'enc_in': 862, 'e_layers': 3, 'n_heads': 8, 'd_model': 512, 'd_ff': 512,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 16, 'learning_rate': 0.001,
+        'patience': 3, 'lradj': 'type1'
     },
     'weather': {
-        'enc_in': 21, 'e_layers': 3, 'n_heads': 16, 'd_model': 128, 'd_ff': 256,
-        'dropout': 0.2, 'fc_dropout': 0.2, 'head_dropout': 0,
-        'train_epochs': 100, 'batch_size': 128, 'learning_rate': 0.0001,
-        'patience': 20
+        'enc_in': 21, 'e_layers': 1, 'n_heads': 8, 'd_model': 256, 'd_ff': 512,
+        'dropout': 0.1,
+        'train_epochs': 10, 'batch_size': 4, 'learning_rate': 0.0001,
+        'patience': 3, 'lradj': 'type1'
     }
 }
 
-# ==================================================================================
-# [2] 실험 변수 설정
-# ==================================================================================
 
+# ==================================================================================
+# [2] Baseline Experiment Config
+# ==================================================================================
 DATASETS = {
     'etth1': 'ETTh1.csv',
-    # 'etth2': 'ETTh2.csv',
-      'ettm1': 'ETTm1.csv',
-    # 'ettm2': 'ETTm2.csv',
-    # 'electricity': 'electricity.csv',    
-    #  'traffic': 'traffic.csv',
-      'weather': 'weather.csv',
+    'ettm1': 'ETTm1.csv',
+    'weather': 'weather.csv',
 }
 
-# PATCH_LENS는 이제 "Base Patch Length" (가장 작은 패치 길이)를 의미합니다.
-PATCH_LENS = [16] 
+PATCH_LENS = [16]
 PRED_LENS = [96, 192, 336, 720]
 
-# Scales 설정: [1]은 기존 PatchTST와 동일, [1, 2]는 16, 32 길이 동시 사용
-SCALES_LIST = [
-    [1], 
-    [1, 2], 
-    [1, 4],
-    [1, 3, 5], 
-    [1, 2, 3],
-    [1, 4, 8]
-]
+SEQ_LEN = 96
+SCALES = [1, 3, 5]
+STRIDE_STRATEGY = 'half'
+PE_MODE = 'rope_abs'
 
-SEQ_LEN = 336
-MODEL_NAME = 'PatchTST' # Multi-Scale 코드가 PatchTST 클래스로 덮어씌워졌다면 그대로 사용
-RESULT_FILE = 'experiment_results_multi_halfstride_patchlength_info.csv'
-LOG_DIR = './logs_multi_halfstride_patchlength_info/'
+MODEL_NAME = 'PatchTST'
+RESULT_FILE = 'experiment_results_baseline.csv'
+LOG_DIR = './logs_baseline/'
+LOCK_FILE = '.run_experiments_baseline.lock'
+
 RESULT_COLUMNS = [
     'Timestamp', 'Dataset', 'Seq_Len', 'Pred_Len',
     'Base_Patch_Len', 'Strides', 'Patch_Counts', 'Scales',
-    'MSE', 'MAE', 'Len_Alpha', 'Cross_Alpha', 'Log_File', 'Hyperparams'
+    'MSE', 'MAE', 'Log_File', 'Hyperparams'
 ]
 
-# ==================================================================================
-# [3] 유틸리티 함수
-# ==================================================================================
 
+# ==================================================================================
+# [3] Utility Helpers
+# ==================================================================================
 def compute_scale_patch_num(seq_len, base_patch_len, patch_len, stride, padding_patch='end'):
-    # Match MultiScalePatchTST_backbone._compute_patch_num
     pad_left = (patch_len - base_patch_len) // 2
     pad_right = stride if padding_patch == 'end' else 0
     padded_len = seq_len + pad_left + pad_right
@@ -108,14 +96,21 @@ def compute_scale_patch_num(seq_len, base_patch_len, patch_len, stride, padding_
         return 1
     return int((padded_len - patch_len) / stride + 1)
 
+
 def build_scale_info(seq_len, base_patch_len, scales, padding_patch='end'):
     patch_lens = [base_patch_len * s for s in scales]
-    strides = [max(1, pl // 2) for pl in patch_lens]
+    strides = [max(1, int(round(pl * 0.5))) for pl in patch_lens]
     patch_counts = [
-        compute_scale_patch_num(seq_len, base_patch_len, pl, st, padding_patch=padding_patch)
-        for pl, st in zip(patch_lens, strides)
+        compute_scale_patch_num(seq_len, base_patch_len, patch_len, stride, padding_patch=padding_patch)
+        for patch_len, stride in zip(patch_lens, strides)
     ]
     return patch_lens, strides, patch_counts
+
+
+def compose_model_id(dataset_name, pred_len, base_patch_len):
+    scales_str = '_'.join(map(str, SCALES))
+    return f"{dataset_name}_sl{SEQ_LEN}_pl{pred_len}_base{base_patch_len}_sc{scales_str}"
+
 
 def parse_metrics(output_str):
     try:
@@ -126,312 +121,303 @@ def parse_metrics(output_str):
         pass
     return None, None
 
-def parse_alphas(output_str):
-    # Expected line from run_longExp.py:
-    # ALPHAS len_alpha=<value> cross_alpha=<value>
-    try:
-        match = re.search(r"ALPHAS\s+len_alpha=([-\deE\.+]+)\s+cross_alpha=([-\deE\.+]+)", output_str)
-        if match:
-            return float(match.group(1)), float(match.group(2))
-    except Exception:
-        pass
-    return None, None
+
+def is_worker_segfault(output_str):
+    lower = output_str.lower()
+    return (
+        "unexpected segmentation fault encountered in worker" in lower
+        or ("dataloader worker" in lower and "segmentation fault" in lower)
+    )
+
+
+def upsert_cmd_arg(cmd, key, value):
+    updated = list(cmd)
+    if key in updated:
+        idx = updated.index(key)
+        if idx + 1 < len(updated):
+            updated[idx + 1] = str(value)
+        else:
+            updated.append(str(value))
+        return updated
+    updated.extend([key, str(value)])
+    return updated
+
+
+def run_and_capture(cmd, log_path, append=False, prefix_note=None):
+    full_output = ""
+    mode = 'a' if append else 'w'
+    with open(log_path, mode, encoding='utf-8', buffering=1) as log_f:
+        if not append:
+            import torch
+            if torch.cuda.is_available():
+                log_f.write(f"GPU: {torch.cuda.get_device_name(0)}\n")
+        else:
+            if prefix_note:
+                log_f.write("\n" + "=" * 20 + f" {prefix_note} " + "=" * 20 + "\n")
+        log_f.write(f"Command: {' '.join(cmd)}\n")
+        log_f.write("-" * 50 + "\n")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        for line in process.stdout:
+            log_f.write(line)
+            log_f.flush()
+            full_output += line
+        process.wait()
+
+    return full_output, process.returncode
+
+
+def build_combinations():
+    return list(itertools.product(DATASETS.keys(), PATCH_LENS, PRED_LENS))
+
 
 def get_data_args(dataset_name):
     d_lower = dataset_name.lower()
-    
-    # 1. ETT Series
+
     if d_lower.startswith('ett'):
-        if d_lower == 'etth1': d_code = 'ETTh1'
-        elif d_lower == 'etth2': d_code = 'ETTh2'
-        elif d_lower == 'ettm1': d_code = 'ETTm1'
-        elif d_lower == 'ettm2': d_code = 'ETTm2'
-        else: d_code = 'ETTh1'
-        
+        if d_lower == 'etth1':
+            d_code = 'ETTh1'
+        elif d_lower == 'etth2':
+            d_code = 'ETTh2'
+        elif d_lower == 'ettm1':
+            d_code = 'ETTm1'
+        elif d_lower == 'ettm2':
+            d_code = 'ETTm2'
+        else:
+            d_code = 'ETTh1'
         return {
             'data': d_code,
-            'root_path': './dataset/ETT/', 
-            'features': 'M'
-        }
-    
-    # 2. Custom Series
-    else:
-        return {
-            'data': 'custom',
-            'root_path': f'./dataset/{d_lower}/', 
-            'features': 'M'
+            'root_path': './dataset/ETT/',
+            'features': 'M',
         }
 
-def to_float_or_none(v):
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(x):
-        return None
-    return x
+    return {
+        'data': 'custom',
+        'root_path': f'./dataset/{d_lower}/',
+        'features': 'M',
+    }
 
-def _pick_field(row, *keys):
-    for key in keys:
-        val = row.get(key)
-        if val not in (None, ''):
-            return val
-    return ''
 
 def ensure_result_file_schema(path):
     if not os.path.exists(path):
         with open(path, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(RESULT_COLUMNS)
+            csv.writer(f).writerow(RESULT_COLUMNS)
         return
 
     with open(path, mode='r', newline='') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+        rows = list(csv.reader(f))
 
     if not rows:
         with open(path, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(RESULT_COLUMNS)
+            csv.writer(f).writerow(RESULT_COLUMNS)
         return
 
     header = rows[0]
-    if header == RESULT_COLUMNS:
-        return
+    if header != RESULT_COLUMNS:
+        raise ValueError(
+            f"Existing result file has unexpected header: {path}\n"
+            f"Expected: {RESULT_COLUMNS}\n"
+            f"Found: {header}"
+        )
 
-    with open(path, mode='r', newline='') as f:
-        reader = csv.DictReader(f)
-        old_rows = list(reader)
 
-    upgraded_rows = []
-    for row in old_rows:
-        upgraded_rows.append([
-            _pick_field(row, 'Timestamp', 'timestamp'),
-            _pick_field(row, 'Dataset', 'dataset'),
-            _pick_field(row, 'Seq_Len', 'seq_len'),
-            _pick_field(row, 'Pred_Len', 'pred_len'),
-            _pick_field(row, 'Base_Patch_Len', 'base_patch_len'),
-            _pick_field(row, 'Strides', 'Stride', 'stride', 'strides'),
-            _pick_field(
-                row,
-                'Patch_Counts',
-                'Patch_Count',
-                'patch_count_scales',
-                'patch_count',
-                'Patch_Count_Scales'
-            ),
-            _pick_field(row, 'Scales', 'scales'),
-            _pick_field(row, 'MSE', 'mse'),
-            _pick_field(row, 'MAE', 'mae'),
-            _pick_field(row, 'Len_Alpha', 'len_alpha'),
-            _pick_field(row, 'Cross_Alpha', 'cross_alpha'),
-            _pick_field(row, 'Log_File', 'log_file'),
-            _pick_field(row, 'Hyperparams', 'hyperparameter', 'hyperparams')
-        ])
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
-    with open(path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(RESULT_COLUMNS)
-        writer.writerows(upgraded_rows)
 
-    print(f"Upgraded result CSV schema: {path}")
-
-def append_scale_avg_rows(run_records):
-    # Group key: (Dataset, Base_Patch_Len, Scales)
-    grouped = defaultdict(list)
-    for rec in run_records:
-        key = (rec['dataset'], rec['base_patch_len'], rec['scales'])
-        grouped[key].append(rec)
-
-    pred_len_cols = sorted(PRED_LENS)
-    with open(RESULT_FILE, mode='a', newline='') as f:
-        writer = csv.writer(f)
-
-        for (dataset, base_patch_len, scales), rows in sorted(grouped.items()):
-            mse_vals = []
-            mae_vals = []
-            len_alpha_vals = []
-            cross_alpha_vals = []
-            row_by_pl = {r['pred_len']: r for r in rows}
-            completed = 0
-
-            # collect average over available pred_lens
-            details = []
-            for pl in pred_len_cols:
-                r = row_by_pl.get(pl)
-                if r is None:
-                    continue
-                mse = to_float_or_none(r['mse'])
-                mae = to_float_or_none(r['mae'])
-                if mse is not None:
-                    mse_vals.append(mse)
-                if mae is not None:
-                    mae_vals.append(mae)
-                if (mse is not None) or (mae is not None):
-                    completed += 1
-                len_a = to_float_or_none(r['len_alpha'])
-                cross_a = to_float_or_none(r['cross_alpha'])
-                if len_a is not None:
-                    len_alpha_vals.append(len_a)
-                if cross_a is not None:
-                    cross_alpha_vals.append(cross_a)
-                details.append(
-                    f"pl{pl}:mse={r['mse']},mae={r['mae']},len_alpha={r['len_alpha']},cross_alpha={r['cross_alpha']}"
-                )
-
-            avg_mse = sum(mse_vals) / len(mse_vals) if mse_vals else float('nan')
-            avg_mae = sum(mae_vals) / len(mae_vals) if mae_vals else float('nan')
-            avg_len_alpha = sum(len_alpha_vals) / len(len_alpha_vals) if len_alpha_vals else float('nan')
-            avg_cross_alpha = sum(cross_alpha_vals) / len(cross_alpha_vals) if cross_alpha_vals else float('nan')
-            strides_safe = rows[0]['strides']
-            patch_counts_safe = rows[0]['patch_counts']
-            detail_str = f"AVG_BY_PRED_LEN;completed={completed};" + ";".join(details)
-
-            # Reuse the existing RESULT_FILE schema and append one avg row per scale combo.
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                dataset, SEQ_LEN, "AVG",
-                base_patch_len, strides_safe, patch_counts_safe, scales,
-                avg_mse, avg_mae, avg_len_alpha, avg_cross_alpha, "SUMMARY", detail_str
-            ])
-
-# ==================================================================================
-# [4] 메인 실행 루프
-# ==================================================================================
-
-def run_experiments():
-    print("=" * 60)
-    print("Checking GPU Environment...")
-    if torch.cuda.is_available():
-        print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print(f"❌ GPU is NOT available. Running on CPU.")
-    print("=" * 60)
-    
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
-
-    ensure_result_file_schema(RESULT_FILE)
-
-    combinations = list(itertools.product(DATASETS.keys(), PATCH_LENS, PRED_LENS, SCALES_LIST))
-    total_exps = len(combinations)
-    run_records = []
-    
-    print(f"\nTotal Experiments: {total_exps}")
-    
-    for idx, (dataset_name, p_len, pred_len, scales) in enumerate(combinations):
-        d_file = DATASETS[dataset_name]
-        data_config = get_data_args(dataset_name)
-        patch_lens, strides, patch_counts = build_scale_info(SEQ_LEN, p_len, scales, padding_patch='end')
-        stride = strides[0]
-        
-        scales_str = '_'.join(map(str, scales))
-        model_id = f"{dataset_name}_pl{pred_len}_base{p_len}_sc{scales_str}"
-        log_filename = f"{model_id}.log"
-        log_path = os.path.join(LOG_DIR, log_filename)
-        
-        hyper_params = HYPER_PARAMS.get(dataset_name, {})
-        
-        # Command 구성
-        cmd = [
-            "python", "-u", "run_longExp.py",
-            "--is_training", "1",
-            "--model_id", model_id,
-            "--model", MODEL_NAME,
-            "--data", data_config['data'],
-            "--root_path", data_config['root_path'],
-            "--data_path", d_file,
-            "--features", data_config['features'],
-            "--seq_len", str(SEQ_LEN),
-            "--pred_len", str(pred_len),
-            "--patch_len", str(p_len),  # 이것이 Base Patch Length가 됨
-            "--stride", str(stride),
-            "--des", "Exp",
-            "--itr", "1",
-            "--use_amp"
-        ]
-
-        # Add Scales Argument (list로 전달)
-        cmd.append("--scales")
-        cmd.extend(map(str, scales))
-
-        for key, value in hyper_params.items():
-            cmd.append(f"--{key}")
-            cmd.append(str(value))
-        
-        print(f"\n[{idx+1}/{total_exps}] Running: {model_id}")
-        # print(f"Command: {' '.join(cmd)}") # 디버깅용 커맨드 출력
-
-        full_output = ""
+def acquire_run_lock(path):
+    if os.path.exists(path):
         try:
-            with open(log_path, "w", encoding="utf-8") as log_f:
-                if torch.cuda.is_available():
-                    log_f.write(f"GPU: {torch.cuda.get_device_name(0)}\n")
-                log_f.write(f"Command: {' '.join(cmd)}\n")
-                log_f.write("-" * 50 + "\n")
+            with open(path, 'r', encoding='utf-8') as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pid = -1
+        if _pid_alive(pid):
+            raise RuntimeError(f"another run.experiments.py is already running (pid={pid})")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(str(os.getpid()))
 
-                process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
-                    text=True, 
-                    bufsize=1
-                )
-                for line in process.stdout:
-                    log_f.write(line)
-                    full_output += line
-                    # 진행상황을 터미널에도 간략히 출력하고 싶다면 주석 해제
-                    # print(line, end='') 
-                process.wait()
 
-            mse, mae = parse_metrics(full_output)
-            len_alpha, cross_alpha = parse_alphas(full_output)
-            
-            if mse is not None:
-                print(f"   > Success! MSE={mse}, MAE={mae}")
-            else:
-                print(f"   > Warning: Metrics not found. Check log.")
-                mse, mae = "NaN", "NaN"
-            if len_alpha is None or cross_alpha is None:
-                print("   > Warning: Alpha values not found. Check log.")
-                len_alpha, cross_alpha = "NaN", "NaN"
+def release_run_lock(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
-            scales_safe = str(scales).replace(',', ';')
-            strides_safe = str(strides).replace(',', ';')
-            patch_counts_safe = str(patch_counts).replace(',', ';')
-            params_safe = str(hyper_params).replace(',', ';')
 
-            with open(RESULT_FILE, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    dataset_name, SEQ_LEN, pred_len,
-                    p_len, strides_safe, patch_counts_safe, scales_safe,
-                    mse, mae, len_alpha, cross_alpha, log_filename, params_safe
-                ])
+# ==================================================================================
+# [4] Main Loop
+# ==================================================================================
+def run_experiments(start_model_id=None, num_workers_override=None):
+    import torch
 
-            run_records.append({
-                'dataset': dataset_name,
-                'base_patch_len': p_len,
-                'pred_len': pred_len,
-                'scales': scales_safe,
-                'strides': strides_safe,
-                'patch_counts': patch_counts_safe,
-                'mse': mse,
-                'mae': mae,
-                'len_alpha': len_alpha,
-                'cross_alpha': cross_alpha,
-            })
-                
-        except Exception as e:
-            print(f"   > Python Script Error: {e}")
-            continue
+    acquire_run_lock(LOCK_FILE)
+    try:
+        print("=" * 60)
+        print("Checking GPU Environment...")
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("GPU is NOT available. Running on CPU.")
+        print("=" * 60)
 
-    if run_records:
-        append_scale_avg_rows(run_records)
-        print(f"\nAverage rows appended to: {RESULT_FILE}")
+        os.makedirs(LOG_DIR, exist_ok=True)
+        ensure_result_file_schema(RESULT_FILE)
 
-    print(f"\nAll experiments finished!")
+        combinations = build_combinations()
+        total_exps = len(combinations)
+        print(f"\nTotal Experiments: {total_exps}")
+
+        start_idx = 0
+        if start_model_id:
+            found_idx = -1
+            for idx, (dataset_name, patch_len, pred_len) in enumerate(combinations):
+                model_id = compose_model_id(dataset_name, pred_len, patch_len)
+                if model_id == start_model_id:
+                    found_idx = idx
+                    break
+            if found_idx < 0:
+                raise ValueError(f"start_model_id not found in combinations: {start_model_id}")
+            start_idx = found_idx
+            print(f"Resuming from [{start_idx + 1}/{total_exps}] {start_model_id}")
+
+        for idx in range(start_idx, total_exps):
+            dataset_name, patch_len, pred_len = combinations[idx]
+            data_file = DATASETS[dataset_name]
+            data_config = get_data_args(dataset_name)
+            _, strides, patch_counts = build_scale_info(SEQ_LEN, patch_len, SCALES, padding_patch='end')
+            stride = strides[0]
+
+            model_id = compose_model_id(dataset_name, pred_len, patch_len)
+            log_filename = f"{model_id}.log"
+            log_path = os.path.join(LOG_DIR, log_filename)
+            hyper_params = HYPER_PARAMS.get(dataset_name, {})
+
+            cmd = [
+                sys.executable, "-u", "run_longExp.py",
+                "--is_training", "1",
+                "--model_id", model_id,
+                "--model", MODEL_NAME,
+                "--data", data_config['data'],
+                "--root_path", data_config['root_path'],
+                "--data_path", data_file,
+                "--features", data_config['features'],
+                "--seq_len", str(SEQ_LEN),
+                "--pred_len", str(pred_len),
+                "--patch_len", str(patch_len),
+                "--stride", str(stride),
+                "--stride_strategy", STRIDE_STRATEGY,
+                "--pe", PE_MODE,
+                "--des", "Exp",
+                "--itr", "1",
+                "--use_amp",
+                "--scales",
+                *map(str, SCALES),
+            ]
+            if num_workers_override is not None:
+                cmd.extend(["--num_workers", str(num_workers_override)])
+
+            for key, value in hyper_params.items():
+                cmd.extend([f"--{key}", str(value)])
+
+            print(f"\n[{idx + 1}/{total_exps}] Running: {model_id}")
+
+            try:
+                full_output, retcode = run_and_capture(cmd, log_path, append=False)
+
+                if retcode != 0 and is_worker_segfault(full_output):
+                    print("   > Worker segmentation fault detected. Retrying with --num_workers 0 ...")
+                    retry_cmd = upsert_cmd_arg(cmd, "--num_workers", "0")
+                    retry_output, retry_retcode = run_and_capture(
+                        retry_cmd, log_path, append=True, prefix_note="RETRY_WITH_NUM_WORKERS_0"
+                    )
+                    full_output += "\n" + retry_output
+                    retcode = retry_retcode
+
+                mse, mae = parse_metrics(full_output)
+                if retcode == 0 and mse is not None:
+                    print(f"   > Success! MSE={mse}, MAE={mae}")
+                else:
+                    if retcode != 0:
+                        print(f"   > Warning: process exited with code {retcode}. Check log.")
+                    else:
+                        print("   > Warning: Metrics not found. Check log.")
+                    mse, mae = "NaN", "NaN"
+
+                with open(RESULT_FILE, mode='a', newline='') as f:
+                    csv.writer(f).writerow([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        dataset_name,
+                        SEQ_LEN,
+                        pred_len,
+                        patch_len,
+                        str(strides).replace(',', ';'),
+                        str(patch_counts).replace(',', ';'),
+                        str(SCALES).replace(',', ';'),
+                        mse,
+                        mae,
+                        log_filename,
+                        str(hyper_params).replace(',', ';'),
+                    ])
+            except Exception as e:
+                print(f"   > Python Script Error: {e}")
+                continue
+
+        print("\nAll experiments finished!")
+        return 'finished'
+    finally:
+        release_run_lock(LOCK_FILE)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run the fixed baseline PatchTST experiment sweep.')
+    parser.add_argument(
+        '--start_model_id',
+        type=str,
+        default='',
+        help='resume from this model_id (inclusive)',
+    )
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=None,
+        help='override DataLoader num_workers for run_longExp.py',
+    )
+
+    raw_argv = sys.argv[1:]
+    cleaned_argv = []
+    for tok in raw_argv:
+        tok_clean = tok.replace('\u00A0', ' ').strip()
+        if tok_clean:
+            cleaned_argv.append(tok_clean)
+
+    args, unknown = parser.parse_known_args(cleaned_argv)
+    unknown = [u for u in unknown if u.replace('\u00A0', ' ').strip()]
+    if unknown:
+        parser.error("unrecognized arguments: " + " ".join(repr(u) for u in unknown))
+    return args
+
 
 if __name__ == "__main__":
-    run_experiments()
+    args = parse_args()
+    run_experiments(
+        start_model_id=(args.start_model_id.strip() or None),
+        num_workers_override=args.num_workers,
+    )

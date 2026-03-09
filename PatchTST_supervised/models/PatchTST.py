@@ -15,7 +15,7 @@ from layers.PatchTST_layers import series_decomp
 class Model(nn.Module):
     def __init__(self, configs, max_seq_len:Optional[int]=1024, d_k:Optional[int]=None, d_v:Optional[int]=None, norm:str='BatchNorm', attn_dropout:float=0., 
                  act:str="gelu", key_padding_mask:bool='auto',padding_var:Optional[int]=None, attn_mask:Optional[Tensor]=None, res_attention:bool=True, 
-                 pre_norm:bool=False, store_attn:bool=False, pe:str='zeros', learn_pe:bool=True, pretrain_head:bool=False, head_type = 'flatten', verbose:bool=False, **kwargs):
+                 pre_norm:bool=False, store_attn:bool=False, pe:str='rope_abs', learn_pe:bool=False, pretrain_head:bool=False, head_type = 'flatten', verbose:bool=False, **kwargs):
         
         super().__init__()
 
@@ -50,6 +50,11 @@ class Model(nn.Module):
         
         decomposition = configs.decomposition
         kernel_size = configs.kernel_size
+        len_alpha_fixed = getattr(configs, 'len_alpha_fixed', None)
+        cross_alpha_fixed = getattr(configs, 'cross_alpha_fixed', None)
+        learn_alpha = bool(getattr(configs, 'learn_alpha', 1))
+        pe = getattr(configs, 'pe', pe)
+        learn_pe = bool(getattr(configs, 'learn_pe', int(learn_pe)))
         
         
         # model
@@ -63,7 +68,9 @@ class Model(nn.Module):
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
-                                  subtract_last=subtract_last, verbose=verbose, **kwargs)
+                                  subtract_last=subtract_last, verbose=verbose,
+                                  len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  **kwargs)
             self.model_res = MultiScalePatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_lens=patch_lens, strides=strides, 
                                   max_seq_len=max_seq_len, n_layers=n_layers, d_model=d_model,
                                   n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout,
@@ -71,7 +78,9 @@ class Model(nn.Module):
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
-                                  subtract_last=subtract_last, verbose=verbose, **kwargs)
+                                  subtract_last=subtract_last, verbose=verbose,
+                                  len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  **kwargs)
         else:
             self.model = MultiScalePatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_lens=patch_lens, strides=strides, 
                                   max_seq_len=max_seq_len, n_layers=n_layers, d_model=d_model,
@@ -80,7 +89,9 @@ class Model(nn.Module):
                                   attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
                                   pe=pe, learn_pe=learn_pe, fc_dropout=fc_dropout, head_dropout=head_dropout, padding_patch = padding_patch,
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
-                                  subtract_last=subtract_last, verbose=verbose, **kwargs)
+                                  subtract_last=subtract_last, verbose=verbose,
+                                  len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  **kwargs)
     
     
     def forward(self, x):           # x: [Batch, Input length, Channel]
