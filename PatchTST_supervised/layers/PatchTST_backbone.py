@@ -65,8 +65,14 @@ class MultiScalePatchTST_backbone(nn.Module):
         _ = kwargs.pop('len_alpha_fixed', None)
         cross_alpha_fixed = kwargs.pop('cross_alpha_fixed', None)
         learn_alpha = bool(kwargs.pop('learn_alpha', True))
+        self.use_global_token = bool(kwargs.pop('use_global_token', True))
+        self.global_kernel_size = int(kwargs.pop('global_kernel_size', min(17, context_window)))
         # Deprecated compatibility flag; projection is now fixed to 1-layer.
         _ = kwargs.pop('patch_embed_act', None)
+        if self.global_kernel_size < 1 or self.global_kernel_size > context_window:
+            raise ValueError(
+                f"global_kernel_size must be in [1, {context_window}], got {self.global_kernel_size}"
+            )
         
         # 1. RevIn
         self.revin = revin
@@ -106,6 +112,12 @@ class MultiScalePatchTST_backbone(nn.Module):
         # 3. Projections & Embeddings
         # 각 스케일별로 다른 Projection Layer를 가짐 (길이가 달라도 d_model로 통일)
         self.W_P = nn.ModuleList([build_patch_projection(pl, d_model) for pl in patch_lens])
+        self.global_proj = nn.Sequential(
+            nn.Conv1d(1, d_model, kernel_size=self.global_kernel_size, padding=self.global_kernel_size // 2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.global_type_emb = nn.Parameter(torch.zeros(1, 1, 1, d_model))
         
         # Scale Embedding: 각 스케일 ID에 대한 임베딩 (0: scale1, 1: scale2 ...)
         self.scale_embedding = nn.Embedding(len(patch_lens), d_model)
@@ -134,7 +146,7 @@ class MultiScalePatchTST_backbone(nn.Module):
 
         # 5. Head
         # Flatten Head의 입력 차원은 (sum(scale별 patch_num) * d_model)
-        self.head_nf = d_model * self.total_patch_num
+        self.head_nf = d_model * (self.total_patch_num + (1 if self.use_global_token else 0))
         self.n_vars = c_in
         self.pretrain_head = pretrain_head
         self.head_type = head_type
@@ -223,10 +235,19 @@ class MultiScalePatchTST_backbone(nn.Module):
             out = emb + pos_emb + scale_emb + cross_term
             scale_tokens.append(out)
 
+        if self.use_global_token:
+            global_input = z.reshape(bs * n_vars, 1, seq_len)
+            global_t = self.global_proj(global_input)  # [bs*nvars, d_model, 1]
+            global_t = global_t.squeeze(-1).reshape(bs, n_vars, -1)  # [bs, nvars, d_model]
+            global_t = global_t.unsqueeze(2) + self.global_type_emb  # [bs, nvars, 1, d_model]
+            tokens = [global_t] + scale_tokens
+        else:
+            tokens = scale_tokens
+
         # Concat all scales
         # 모든 스케일의 토큰을 sequence 차원(dim=2)으로 연결 -> Transformer가 한 번에 처리
-        # z shape: [bs, nvars, sum(scale별 patch_num), d_model]
-        z = torch.cat(scale_tokens, dim=2) 
+        # z shape: [bs, nvars, total_tokens, d_model]
+        z = torch.cat(tokens, dim=2)
         
         # Transpose for Transformer [bs * nvars, seq_len, d_model] logic in backbone
         z = z.permute(0,1,3,2) # [bs, nvars, d_model, total_tokens]

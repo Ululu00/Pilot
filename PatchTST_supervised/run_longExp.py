@@ -58,6 +58,11 @@ if __name__ == '__main__':
                         help='1: learn additive PE table, 0: fixed. Used for additive-only or rope_abs modes.')
     parser.add_argument('--patch_embed_act', type=str, default='relu', choices=['relu', 'gelu'],
                         help="Deprecated compatibility flag. Patch-wise embedding is fixed to 1-layer nn.Linear.")
+    parser.set_defaults(use_global_token=True)
+    parser.add_argument('--no_global_token', dest='use_global_token', action='store_false',
+                        help='Disable Global Token that captures the entire series context.')
+    parser.add_argument('--global_kernel_size', type=int, default=17,
+                        help='Kernel size for the Conv1d-based global token generator.')
 
     # Formers 
     parser.add_argument('--embed_type', type=int, default=0, help='0: default 1: value embedding + temporal embedding + positional embedding 2: value embedding + temporal embedding 3: value embedding + positional embedding 4: value embedding')

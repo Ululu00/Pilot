@@ -55,6 +55,8 @@ class Model(nn.Module):
         learn_alpha = bool(getattr(configs, 'learn_alpha', 1))
         pe = getattr(configs, 'pe', pe)
         learn_pe = bool(getattr(configs, 'learn_pe', int(learn_pe)))
+        use_global_token = bool(getattr(configs, 'use_global_token', True))
+        global_kernel_size = int(getattr(configs, 'global_kernel_size', min(17, context_window)))
         
         
         # model
@@ -70,6 +72,8 @@ class Model(nn.Module):
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose,
                                   len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  use_global_token=use_global_token,
+                                  global_kernel_size=global_kernel_size,
                                   **kwargs)
             self.model_res = MultiScalePatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_lens=patch_lens, strides=strides, 
                                   max_seq_len=max_seq_len, n_layers=n_layers, d_model=d_model,
@@ -80,6 +84,8 @@ class Model(nn.Module):
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose,
                                   len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  use_global_token=use_global_token,
+                                  global_kernel_size=global_kernel_size,
                                   **kwargs)
         else:
             self.model = MultiScalePatchTST_backbone(c_in=c_in, context_window = context_window, target_window=target_window, patch_lens=patch_lens, strides=strides, 
@@ -91,6 +97,8 @@ class Model(nn.Module):
                                   pretrain_head=pretrain_head, head_type=head_type, individual=individual, revin=revin, affine=affine,
                                   subtract_last=subtract_last, verbose=verbose,
                                   len_alpha_fixed=len_alpha_fixed, cross_alpha_fixed=cross_alpha_fixed, learn_alpha=learn_alpha,
+                                  use_global_token=use_global_token,
+                                  global_kernel_size=global_kernel_size,
                                   **kwargs)
     
     

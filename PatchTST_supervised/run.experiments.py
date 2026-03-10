@@ -3,6 +3,7 @@ import csv
 import itertools
 import os
 import re
+import statistics
 import subprocess
 import sys
 from datetime import datetime
@@ -72,11 +73,14 @@ SEQ_LEN = 96
 SCALES = [1, 3, 5]
 STRIDE_STRATEGY = 'half'
 PE_MODE = 'rope_abs'
+EXPERIMENT_ITR = 5
+USE_GLOBAL_TOKEN = True
+GLOBAL_KERNEL_SIZES = [9, 17, 33, 65, 96]
 
 MODEL_NAME = 'PatchTST'
-RESULT_FILE = 'experiment_results_baseline.csv'
-LOG_DIR = './logs_baseline/'
-LOCK_FILE = '.run_experiments_baseline.lock'
+RESULT_FILE = 'experiment_results_global_token_kernel_5.csv'
+LOG_DIR = './logs_global_token_kernel_5/'
+LOCK_FILE = '.run_experiments_global_token_kernel_5.lock'
 
 RESULT_COLUMNS = [
     'Timestamp', 'Dataset', 'Seq_Len', 'Pred_Len',
@@ -107,9 +111,12 @@ def build_scale_info(seq_len, base_patch_len, scales, padding_patch='end'):
     return patch_lens, strides, patch_counts
 
 
-def compose_model_id(dataset_name, pred_len, base_patch_len):
+def compose_model_id(dataset_name, pred_len, base_patch_len, global_kernel_size):
     scales_str = '_'.join(map(str, SCALES))
-    return f"{dataset_name}_sl{SEQ_LEN}_pl{pred_len}_base{base_patch_len}_sc{scales_str}"
+    return (
+        f"{dataset_name}_sl{SEQ_LEN}_pl{pred_len}_base{base_patch_len}_"
+        f"sc{scales_str}_gk{global_kernel_size}"
+    )
 
 
 def parse_metrics(output_str):
@@ -120,6 +127,37 @@ def parse_metrics(output_str):
     except Exception:
         pass
     return None, None
+
+
+def parse_all_metrics(output_str):
+    matches = re.findall(r"mse:([-\deE\.]+), mae:([-\deE\.]+)", output_str)
+    metrics = []
+    for mse_str, mae_str in matches:
+        try:
+            metrics.append((float(mse_str), float(mae_str)))
+        except ValueError:
+            continue
+    return metrics
+
+
+def format_metric(mean_value, std_value=None, show_std=True):
+    if mean_value is None:
+        return "NaN"
+    if std_value is None or not show_std:
+        return f"{mean_value:.4f}"
+    return f"{mean_value:.4f} ± {std_value:.4f}"
+
+
+def extract_metric_mean(metric_str):
+    if metric_str is None:
+        return None
+    match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", str(metric_str))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 def is_worker_segfault(output_str):
@@ -174,7 +212,7 @@ def run_and_capture(cmd, log_path, append=False, prefix_note=None):
 
 
 def build_combinations():
-    return list(itertools.product(DATASETS.keys(), PATCH_LENS, PRED_LENS))
+    return list(itertools.product(DATASETS.keys(), PATCH_LENS, PRED_LENS, GLOBAL_KERNEL_SIZES))
 
 
 def get_data_args(dataset_name):
@@ -225,6 +263,78 @@ def ensure_result_file_schema(path):
             f"Expected: {RESULT_COLUMNS}\n"
             f"Found: {header}"
         )
+
+
+def rewrite_result_file_with_predlen_averages(path):
+    with open(path, mode='r', newline='') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    base_rows = [row for row in rows if row.get('Log_File') != 'SUMMARY']
+    grouped = {}
+    for row in base_rows:
+        key = (
+            row.get('Dataset', ''),
+            row.get('Seq_Len', ''),
+            row.get('Base_Patch_Len', ''),
+            row.get('Strides', ''),
+            row.get('Patch_Counts', ''),
+            row.get('Scales', ''),
+            _extract_hparam_value(row.get('Hyperparams', ''), 'use_global_token'),
+            _extract_hparam_value(row.get('Hyperparams', ''), 'global_kernel_size'),
+            _extract_hparam_value(row.get('Hyperparams', ''), 'itr'),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    summary_rows = []
+    for key, group_rows in sorted(grouped.items()):
+        mse_vals = []
+        mae_vals = []
+        details = []
+        for row in sorted(group_rows, key=lambda r: int(r['Pred_Len'])):
+            mse_val = extract_metric_mean(row.get('MSE'))
+            mae_val = extract_metric_mean(row.get('MAE'))
+            if mse_val is None or mae_val is None:
+                continue
+            mse_vals.append(mse_val)
+            mae_vals.append(mae_val)
+            details.append(f"pl{row['Pred_Len']}:mse={row['MSE']},mae={row['MAE']}")
+
+        if not mse_vals or not mae_vals:
+            continue
+
+        dataset, seq_len, base_patch_len, strides, patch_counts, scales, use_global_token, global_kernel_size, itr = key
+        summary_rows.append({
+            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'Dataset': dataset,
+            'Seq_Len': seq_len,
+            'Pred_Len': 'AVG',
+            'Base_Patch_Len': base_patch_len,
+            'Strides': strides,
+            'Patch_Counts': patch_counts,
+            'Scales': scales,
+            'MSE': format_metric(sum(mse_vals) / len(mse_vals)),
+            'MAE': format_metric(sum(mae_vals) / len(mae_vals)),
+            'Log_File': 'SUMMARY',
+            'Hyperparams': (
+                f"{{'use_global_token': {use_global_token}; "
+                f"'global_kernel_size': {global_kernel_size}; "
+                f"'itr': {itr}; 'pred_len_avg': True; 'details': '{'; '.join(details)}'}}"
+            ),
+        })
+
+    with open(path, mode='w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(base_rows)
+        writer.writerows(summary_rows)
+
+
+def _extract_hparam_value(hparams_str, key):
+    if not hparams_str:
+        return ''
+    match = re.search(rf"[\"']?{re.escape(key)}[\"']?\s*:\s*([-\w\.]+)", hparams_str)
+    return match.group(1) if match else ''
 
 
 def _pid_alive(pid):
@@ -288,8 +398,8 @@ def run_experiments(start_model_id=None, num_workers_override=None):
         start_idx = 0
         if start_model_id:
             found_idx = -1
-            for idx, (dataset_name, patch_len, pred_len) in enumerate(combinations):
-                model_id = compose_model_id(dataset_name, pred_len, patch_len)
+            for idx, (dataset_name, patch_len, pred_len, global_kernel_size) in enumerate(combinations):
+                model_id = compose_model_id(dataset_name, pred_len, patch_len, global_kernel_size)
                 if model_id == start_model_id:
                     found_idx = idx
                     break
@@ -299,13 +409,13 @@ def run_experiments(start_model_id=None, num_workers_override=None):
             print(f"Resuming from [{start_idx + 1}/{total_exps}] {start_model_id}")
 
         for idx in range(start_idx, total_exps):
-            dataset_name, patch_len, pred_len = combinations[idx]
+            dataset_name, patch_len, pred_len, global_kernel_size = combinations[idx]
             data_file = DATASETS[dataset_name]
             data_config = get_data_args(dataset_name)
             _, strides, patch_counts = build_scale_info(SEQ_LEN, patch_len, SCALES, padding_patch='end')
             stride = strides[0]
 
-            model_id = compose_model_id(dataset_name, pred_len, patch_len)
+            model_id = compose_model_id(dataset_name, pred_len, patch_len, global_kernel_size)
             log_filename = f"{model_id}.log"
             log_path = os.path.join(LOG_DIR, log_filename)
             hyper_params = HYPER_PARAMS.get(dataset_name, {})
@@ -325,12 +435,15 @@ def run_experiments(start_model_id=None, num_workers_override=None):
                 "--stride", str(stride),
                 "--stride_strategy", STRIDE_STRATEGY,
                 "--pe", PE_MODE,
+                "--global_kernel_size", str(global_kernel_size),
                 "--des", "Exp",
-                "--itr", "1",
+                "--itr", str(EXPERIMENT_ITR),
                 "--use_amp",
                 "--scales",
                 *map(str, SCALES),
             ]
+            if not USE_GLOBAL_TOKEN:
+                cmd.append("--no_global_token")
             if num_workers_override is not None:
                 cmd.extend(["--num_workers", str(num_workers_override)])
 
@@ -351,15 +464,38 @@ def run_experiments(start_model_id=None, num_workers_override=None):
                     full_output += "\n" + retry_output
                     retcode = retry_retcode
 
-                mse, mae = parse_metrics(full_output)
-                if retcode == 0 and mse is not None:
-                    print(f"   > Success! MSE={mse}, MAE={mae}")
+                metric_pairs = parse_all_metrics(full_output)
+                if retcode == 0 and len(metric_pairs) == EXPERIMENT_ITR:
+                    mse_vals = [m for m, _ in metric_pairs]
+                    mae_vals = [a for _, a in metric_pairs]
+                    mse_mean = sum(mse_vals) / len(mse_vals)
+                    mae_mean = sum(mae_vals) / len(mae_vals)
+                    show_std = EXPERIMENT_ITR != 1 and len(mse_vals) > 1
+                    mse_std = statistics.stdev(mse_vals) if show_std else None
+                    mae_std = statistics.stdev(mae_vals) if show_std else None
+                    mse = format_metric(mse_mean, mse_std, show_std=show_std)
+                    mae = format_metric(mae_mean, mae_std, show_std=show_std)
+                    print(f"   > Success! AVG MSE={mse}, AVG MAE={mae} over {len(metric_pairs)} runs")
                 else:
                     if retcode != 0:
                         print(f"   > Warning: process exited with code {retcode}. Check log.")
                     else:
-                        print("   > Warning: Metrics not found. Check log.")
+                        print(
+                            f"   > Warning: Expected {EXPERIMENT_ITR} metric rows, "
+                            f"found {len(metric_pairs)}. Check log."
+                        )
                     mse, mae = "NaN", "NaN"
+
+                row_params = dict(hyper_params)
+                row_params['use_global_token'] = USE_GLOBAL_TOKEN
+                row_params['global_kernel_size'] = global_kernel_size
+                row_params['itr'] = EXPERIMENT_ITR
+                row_params['metric_count'] = len(metric_pairs)
+                if retcode == 0 and len(metric_pairs) == EXPERIMENT_ITR:
+                    row_params['mse_mean'] = round(mse_mean, 10)
+                    row_params['mse_std'] = round(mse_std or 0.0, 10)
+                    row_params['mae_mean'] = round(mae_mean, 10)
+                    row_params['mae_std'] = round(mae_std or 0.0, 10)
 
                 with open(RESULT_FILE, mode='a', newline='') as f:
                     csv.writer(f).writerow([
@@ -374,20 +510,22 @@ def run_experiments(start_model_id=None, num_workers_override=None):
                         mse,
                         mae,
                         log_filename,
-                        str(hyper_params).replace(',', ';'),
+                        str(row_params).replace(',', ';'),
                     ])
             except Exception as e:
                 print(f"   > Python Script Error: {e}")
                 continue
 
         print("\nAll experiments finished!")
+        rewrite_result_file_with_predlen_averages(RESULT_FILE)
+        print(f"Pred-len average rows updated in: {RESULT_FILE}")
         return 'finished'
     finally:
         release_run_lock(LOCK_FILE)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run the fixed baseline PatchTST experiment sweep.')
+    parser = argparse.ArgumentParser(description='Run the global-token PatchTST kernel sweep.')
     parser.add_argument(
         '--start_model_id',
         type=str,
